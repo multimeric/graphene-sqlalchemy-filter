@@ -1,6 +1,7 @@
 # Standard Library
 import contextlib
 import inspect
+import re
 import warnings
 from copy import deepcopy
 from functools import lru_cache
@@ -12,7 +13,7 @@ from graphene.types.inputobjecttype import InputObjectTypeOptions
 from graphene.types.utils import get_field_as
 from graphene_sqlalchemy import __version__ as gqls_version
 from graphene_sqlalchemy.converter import convert_sqlalchemy_type
-from graphql import ResolveInfo
+from graphql import GraphQLResolveInfo
 
 # Database
 from sqlalchemy import and_, cast, inspection, not_, or_, types
@@ -32,16 +33,19 @@ from sqlalchemy.sql import sqltypes
 
 MYPY = False
 if MYPY:
+    # Standard Library
     from typing import (  # noqa: F401; pragma: no cover
         Any,
         Callable,
         Dict,
         Iterable,
         List,
-        Type,
         Tuple,
+        Type,
         Union,
     )
+
+    # Database
     from sqlalchemy import Column  # noqa: F401; pragma: no cover
     from sqlalchemy.orm.query import (  # noqa: F401; pragma: no cover
         _MapperEntity,
@@ -55,12 +59,15 @@ if MYPY:
 
 
 try:
+    # Third Party
     from sqlalchemy_utils import TSVectorType
 except ImportError:
     TSVectorType = object
 
-
-gqls_version = tuple([int(x) for x in gqls_version.split('.')])
+try:
+    gqls_version = tuple([int(x) for x in gqls_version.split('.')])
+except ValueError:
+    gqls_version = tuple([int(x) for x in re.findall(r'\d+',gqls_version)])
 
 
 def _get_class(obj: 'GRAPHENE_OBJECT_OR_CLASS') -> 'Type[graphene.ObjectType]':
@@ -818,7 +825,7 @@ class FilterSet(graphene.InputObjectType):
 
     @classmethod
     def filter(
-        cls, info: ResolveInfo, query: Query, filters: 'FilterType'
+        cls, info: GraphQLResolveInfo, query: Query, filters: 'FilterType'
     ) -> Query:
         """
         Return a new query instance with the args ANDed to the existing set.
@@ -897,9 +904,66 @@ class FilterSet(graphene.InputObjectType):
         raise KeyError('Operator not found "{}"'.format(graphql_field))
 
     @classmethod
+    def _translate_filter(
+        cls, info: GraphQLResolveInfo, query: Query, key: str, value: 'Any'
+    ) -> 'Tuple[Query, Any]':
+        """
+        Translate GraphQL to SQLAlchemy filters.
+
+        Args:
+            info: GraphQL resolve info.
+            query: SQLAlchemy query.
+            key: Filter key: model field, 'or', 'and', 'not', custom filter.
+            value: Filter value.
+
+        Returns:
+            SQLAlchemy clause.
+
+        """
+        if key in cls._custom_filters:
+            filter_name = key + '_filter'
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', SAWarning)
+                clause = getattr(cls, filter_name)(info, query, value)
+                if isinstance(clause, tuple):
+                    query, clause = clause
+
+            return query, clause
+
+        if key == cls.GRAPHQL_EXPRESSION_NAMES[cls.AND]:
+            return cls._translate_many_filter(info, query, value, and_)
+
+        if key == cls.GRAPHQL_EXPRESSION_NAMES[cls.OR]:
+            return cls._translate_many_filter(info, query, value, or_)
+
+        if key == cls.GRAPHQL_EXPRESSION_NAMES[cls.NOT]:
+            return cls._translate_many_filter(
+                info, query, value, lambda *x: not_(and_(*x))
+            )
+
+        field, expression = cls._split_graphql_field(key)
+        filter_function = cls.FILTER_FUNCTIONS[expression]
+
+        try:
+            model_field = getattr(cls.model, field)
+        except AttributeError:
+            raise KeyError('Field not found: ' + field)
+
+        model_field_type = getattr(model_field, 'type', None)
+        is_enum = isinstance(model_field_type, sqltypes.Enum)
+        if is_enum and model_field_type.enum_class:
+            if isinstance(value, list):
+                value = [model_field_type.enum_class(v) for v in value]
+            else:
+                value = model_field_type.enum_class(value)
+
+        clause = filter_function(model_field, value)
+        return query, clause
+
+    @classmethod
     def _translate_many_filter(
         cls,
-        info: ResolveInfo,
+        info: GraphQLResolveInfo,
         query: Query,
         filters: 'Union[List[FilterType], FilterType]',
         join_by: 'Callable',
